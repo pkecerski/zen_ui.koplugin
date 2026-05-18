@@ -139,19 +139,7 @@ local function apply_browser_cover_rounded_corners()
             local tx, ty = target.dimen.x, target.dimen.y
             local tw, th = target.dimen.w, target.dimen.h
             local bsz    = math.max(1, target.bordersize or 0)
-            -- Diagnostic: log FakeCover coords for comparison with opening_banner.
-            if not self._has_cover_image then
-                local cut_samples = {}
-                for _i = 0, math.min(4, corner_radius - 1) do
-                    local inner = math.sqrt(corner_radius * corner_radius - (corner_radius - _i) * (corner_radius - _i))
-                    local cut   = math.ceil(corner_radius - inner)
-                    cut_samples[#cut_samples + 1] = "j=" .. _i .. ":cut=" .. cut
-                end
-                logger.warn("zen-ui rounded: FakeCover" ..
-                    " tx=" .. tx .. " ty=" .. ty .. " tw=" .. tw .. " th=" .. th ..
-                    " bottom_row=" .. (ty + th - 1) .. " r=" .. corner_radius .. " bsz=" .. bsz ..
-                    " cuts=[" .. table.concat(cut_samples, " ") .. "]")
-            end
+
             paintCornerMasks(bb, tx, ty, tw, th, corner_radius)
             paintCornerBorderArcs(bb, tx, ty, tw, th, corner_radius, bsz, Blitbuffer.COLOR_BLACK)
         end
