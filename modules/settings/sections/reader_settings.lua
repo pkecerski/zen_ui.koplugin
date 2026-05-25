@@ -26,13 +26,16 @@ function M.build(ctx)
 
     -- Items available in each slot (excludes dynamic fillers / external content)
     local header_all_items = {
-        { key = "time",        text = _("Time")        },
-        { key = "battery",     text = _("Battery")     },
-        { key = "wifi",        text = _("Wi-Fi")       },
-        { key = "frontlight",  text = _("Brightness")  },
-        { key = "ram",         text = _("RAM usage")   },
-        { key = "disk",        text = _("Disk space")  },
-        { key = "custom_text", text = _("Custom text") },
+        { key = "time",        text = _("Time")          },
+        { key = "battery",     text = _("Battery")       },
+        { key = "wifi",        text = _("Wi-Fi")         },
+        { key = "frontlight",  text = _("Brightness")    },
+        { key = "ram",         text = _("RAM usage")     },
+        { key = "disk",        text = _("Disk space")    },
+        { key = "custom_text", text = _("Custom text")   },
+        { key = "book_title",  text = _("Book title")    },
+        { key = "author",      text = _("Author")        },
+        { key = "chapter",     text = _("Chapter")       },
     }
 
     local HEADER_CANONICAL = {

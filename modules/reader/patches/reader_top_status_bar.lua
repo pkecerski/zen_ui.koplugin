@@ -2,7 +2,8 @@ local function apply_reader_top_status_bar()
     --[[
         Paints a configurable three-zone header at the top of the reader screen (reflowable docs).
         Left / center / right slots each hold an ordered list of item keys.
-        Items: time, battery, wifi, frontlight, ram, disk, custom_text
+        Items: time, battery, wifi, frontlight, ram, disk, custom_text,
+               book_title, author, chapter
         Wraps ReaderView.paintTo. Config via config.reader_top_status_bar.
     --]]
 
@@ -141,6 +142,35 @@ local function apply_reader_top_status_bar()
         return text ~= "" and text or nil, nil
     end
 
+    -- doc_ctx is the ReaderView; its .ui.doc_props has title/authors, .ui.toc has chapter.
+    local function getBookTitleItem(doc_ctx)
+        if not doc_ctx or not doc_ctx.ui then return nil end
+        local props = doc_ctx.ui.doc_props
+        local title = props and props.title
+        if not title or title == "" then return nil end
+        if #title > 40 then title = title:sub(1, 37) .. "..." end
+        return title, nil
+    end
+
+    local function getAuthorItem(doc_ctx)
+        if not doc_ctx or not doc_ctx.ui then return nil end
+        local props = doc_ctx.ui.doc_props
+        local authors = props and props.authors
+        if not authors or authors == "" then return nil end
+        if #authors > 30 then authors = authors:sub(1, 27) .. "..." end
+        return authors, nil
+    end
+
+    local function getChapterItem(doc_ctx)
+        if not doc_ctx or not doc_ctx.ui then return nil end
+        local toc = doc_ctx.ui.toc
+        if not toc then return nil end
+        local chapter = toc:getTocTitleOfCurrentPage()
+        if not chapter or chapter == "" then return nil end
+        if #chapter > 35 then chapter = chapter:sub(1, 32) .. "..." end
+        return chapter, nil
+    end
+
     local item_fetchers = {
         wifi        = getWifiItem,
         disk        = getDiskItem,
@@ -149,11 +179,14 @@ local function apply_reader_top_status_bar()
         battery     = getBatteryItem,
         time        = getTimeItem,
         custom_text = getCustomTextItem,
+        book_title  = getBookTitleItem,
+        author      = getAuthorItem,
+        chapter     = getChapterItem,
     }
 
     -- Builds a HorizontalGroup from an ordered item list.
     -- Returns (group_or_nil, widgets_list) where widgets_list holds all TextWidgets for free().
-    local function buildGroup(order, face, sep)
+    local function buildGroup(order, face, sep, doc_ctx)
         if type(order) ~= "table" or #order == 0 then return nil, {} end
         local group   = HorizontalGroup:new{}
         local widgets = {}
@@ -161,7 +194,7 @@ local function apply_reader_top_status_bar()
         for _i, key in ipairs(order) do
             local fn = item_fetchers[key]
             if fn then
-                local icon, label = fn()
+                local icon, label = fn(doc_ctx)
                 if icon ~= nil then
                     if not first and sep ~= "" then
                         local sep_w = TextWidget:new{ text = sep, face = face, padding = 0 }
@@ -186,8 +219,9 @@ local function apply_reader_top_status_bar()
     end
 
     -- Builds the header widget from current config.
+    -- doc_ctx: ReaderView (or nil); needed for book_title, author, chapter items.
     -- Returns header, all_widgets, header_h, screen_width; or nil if nothing to paint.
-    local function buildHeader()
+    local function buildHeader(doc_ctx)
         local screen_width = Screen:getWidth()
         local cfg = zen_plugin and zen_plugin.config and zen_plugin.config.reader_top_status_bar
         local footer_settings = G_reader_settings:readSetting("footer")
@@ -233,9 +267,9 @@ local function apply_reader_top_status_bar()
         end
 
         local all_widgets = {}
-        local left_grp,   left_ws   = buildGroup(left_order,   face, sep_val)
-        local center_grp, center_ws = buildGroup(center_order, face, sep_val)
-        local right_grp,  right_ws  = buildGroup(right_order,  face, sep_val)
+        local left_grp,   left_ws   = buildGroup(left_order,   face, sep_val, doc_ctx)
+        local center_grp, center_ws = buildGroup(center_order, face, sep_val, doc_ctx)
+        local right_grp,  right_ws  = buildGroup(right_order,  face, sep_val, doc_ctx)
         for _i, w in ipairs(left_ws)   do table.insert(all_widgets, w) end
         for _i, w in ipairs(center_ws) do table.insert(all_widgets, w) end
         for _i, w in ipairs(right_ws)  do table.insert(all_widgets, w) end
@@ -294,7 +328,7 @@ local function apply_reader_top_status_bar()
     -- color e-ink devices (e.g. Kobo Libre Color).
     local function repaintHeader(view)
         if not view._zen_header_dimen then return end
-        local header, all_widgets, header_h, screen_width = buildHeader()
+        local header, all_widgets, header_h, screen_width = buildHeader(view)
         if not header then return end
         local dimen = view._zen_header_dimen
         dimen.h = header_h
@@ -324,7 +358,7 @@ local function apply_reader_top_status_bar()
             return
         end
 
-        local header, all_widgets, header_h, screen_width = buildHeader()
+        local header, all_widgets, header_h, screen_width = buildHeader(self)
         if not header then return end
 
         header:paintTo(bb, x, y)
@@ -382,6 +416,9 @@ local function apply_reader_top_status_bar()
                 if orig_onResume then orig_onResume(rui, ...) end
                 if _autoRefresh then
                     UIManager:unschedule(_autoRefresh)
+                    -- Repaint immediately so header is visible on wakeup
+                    -- without waiting for the next minute tick or page turn.
+                    repaintHeader(view)
                     local t = os.date("*t")
                     UIManager:scheduleIn(60 - t.sec, _autoRefresh)
                 end
