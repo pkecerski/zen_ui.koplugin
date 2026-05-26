@@ -6,7 +6,21 @@ local _ = require("gettext")
 local json = require("json")
 local logger = require("logger")
 
-local GITHUB_RELEASES_URL = "https://api.github.com/repos/AnthonyGress/zen_ui.koplugin/releases"
+local GITHUB_OWNER = "AnthonyGress"
+local GITHUB_REPO = "zen_ui.koplugin"
+local RELEASE_ASSET_NAME = "zen_ui.koplugin.zip"
+local GITHUB_RELEASES_URL = string.format(
+    "https://api.github.com/repos/%s/%s/releases",
+    GITHUB_OWNER,
+    GITHUB_REPO
+)
+
+local TRUSTED_DL_HOSTS = {
+    ["github.com"] = true,
+    ["objects.githubusercontent.com"] = true,
+    ["release-assets.githubusercontent.com"] = true,
+    ["github-releases.githubusercontent.com"] = true,
+}
 
 -- Resolve the plugin root directory from this file's own path so the module
 -- works regardless of where KOReader is installed.
@@ -14,11 +28,19 @@ local PLUGIN_ROOT = require("common/plugin_root")
 
 local M = {}
 
+-- TextBoxWidget supports a tiny formatting protocol for bold spans.
+local PTF_HEADER = "\u{FFF1}"
+local PTF_BOLD_START = "\u{FFF2}"
+local PTF_BOLD_END = "\u{FFF3}"
+
 -- Cached result (populated on first check_for_update call).
 M._checked          = false
 M._has_update       = false
 M._latest_ver       = nil   -- latest version string without leading "v"
 M._dl_url           = nil   -- download URL for release.zip
+M._latest_sha256    = nil   -- expected SHA-256 digest for release.zip
+M._latest_notes     = nil   -- markdown changelog body for the selected latest release
+M._last_error       = nil   -- last update-check error message for UI
 M._banner_loaded    = false -- true after init_banner() has run
 M._wakeup_timer     = nil   -- pending UIManager scheduled function (for unschedule)
 M._check_cancelled  = false -- set to true by cancel_wakeup_check to abort mid-poll
@@ -42,14 +64,9 @@ local function parse_semver(v)
     return tonumber(maj) or 0, tonumber(min) or 0, tonumber(pat) or 0, is_pre, pre_num
 end
 
---- Returns true when a's M.m.p base is strictly greater than b's (ignores pre-release label).
---- Used for channel selection: prefer stable when base versions are equal (graduation path).
-local function semver_base_gt(a, b)
-    local a1, a2, a3 = parse_semver(a)
-    local b1, b2, b3 = parse_semver(b)
-    if a1 ~= b1 then return a1 > b1 end
-    if a2 ~= b2 then return a2 > b2 end
-    return a3 > b3
+local function semver_base(v)
+    local maj, min, pat = parse_semver(v)
+    return string.format("%d.%d.%d", maj, min, pat)
 end
 
 --- Returns true when version string a is strictly greater than b.
@@ -68,6 +85,10 @@ local function semver_gt(a, b)
     return false
 end
 
+local function semver_eq(a, b)
+    return (not semver_gt(a, b)) and (not semver_gt(b, a))
+end
+
 --- Read the current plugin version from _meta.lua.
 local function get_current_version()
     local ok, meta = pcall(dofile, PLUGIN_ROOT .. "/_meta.lua")
@@ -77,39 +98,292 @@ local function get_current_version()
     return "0.0.0"
 end
 
---- Get the zen_ui.koplugin.zip download URL from a decoded release object.
-local function get_asset_url(release)
-    if not release or type(release.assets) ~= "table" then return nil end
-    for _i, asset in ipairs(release.assets) do
-        if asset.name == "zen_ui.koplugin.zip" then
-            return asset.browser_download_url
-        end
-    end
+local function parse_url(url)
+    if type(url) ~= "string" then return nil end
+    local scheme, host, path = url:match("^(https?)://([^/%?#]+)([^#]*)$")
+    if not scheme or not host then return nil end
+    if path == "" then path = "/" end
+    return scheme:lower(), host:lower(), path
 end
 
---- Decode a releases list JSON body and return stable/beta tag+url.
-local function parse_release_list(body)
+local function is_valid_sha256_digest(sha)
+    return type(sha) == "string" and sha:match("^[0-9a-fA-F]+$") ~= nil and #sha == 64
+end
+
+local function parse_sha256_digest(digest)
+    if type(digest) ~= "string" then return nil end
+    local sha = digest:match("^sha256:([0-9a-fA-F]+)$")
+        or digest:match("^([0-9a-fA-F]+)$")
+    if not is_valid_sha256_digest(sha) then return nil end
+    return sha:lower()
+end
+
+--- Validate release asset origin URL before use.
+local function is_valid_asset_url(url)
+    local scheme, host, path = parse_url(url)
+    if not scheme or scheme ~= "https" then return false end
+    if not TRUSTED_DL_HOSTS[host] then return false end
+    if not path then return false end
+    if host == "github.com" then
+        -- parse_url includes query string in path; strip query/fragment for filename checks.
+        local asset_path = path:match("^([^%?#]+)") or path
+        local expected_prefix = string.format("/%s/%s/releases/download/", GITHUB_OWNER, GITHUB_REPO):lower()
+        local normalized_path = asset_path:lower()
+        local asset_suffix = ("/" .. RELEASE_ASSET_NAME):lower()
+        if normalized_path:find(expected_prefix, 1, true) ~= 1 then return false end
+        if normalized_path:sub(-#asset_suffix) ~= asset_suffix then return false end
+    end
+    return true
+end
+
+local function resolve_redirect_url(base_url, location)
+    if type(location) ~= "string" or location == "" then return nil end
+    if location:match("^https?://") then return location end
+    local scheme, host, base_path = parse_url(base_url)
+    if not scheme or not host or not base_path then return nil end
+    if location:sub(1, 1) == "/" then
+        return string.format("%s://%s%s", scheme, host, location)
+    end
+    local base_dir = base_path:match("^(.*)/") or "/"
+    if base_dir == "" then base_dir = "/" end
+    return string.format("%s://%s%s%s", scheme, host, base_dir, location)
+end
+
+--- Get release.zip metadata from a decoded release object.
+local function get_asset_info(release)
+    if not release or type(release.assets) ~= "table" then
+        return nil, "missing_assets_table"
+    end
+    local saw_named_asset = false
+    for _i, asset in ipairs(release.assets) do
+        if asset.name == RELEASE_ASSET_NAME then
+            saw_named_asset = true
+            if is_valid_asset_url(asset.browser_download_url) then
+                return {
+                    url = asset.browser_download_url,
+                    sha256 = parse_sha256_digest(asset.digest),
+                }, nil
+            end
+            logger.warn(
+                "ZenUpdater: rejected asset URL tag=",
+                tostring(release.tag_name),
+                "url=",
+                tostring(asset.browser_download_url)
+            )
+            return nil, "invalid_asset_url"
+        end
+    end
+    if not saw_named_asset then
+        return nil, "missing_named_asset"
+    end
+    return nil, "missing_named_asset"
+end
+
+local function normalize_release_notes(notes)
+    if type(notes) ~= "string" then
+        return _("No changelog provided.")
+    end
+    notes = notes:gsub("\r\n", "\n"):gsub("\r", "\n")
+    notes = notes:gsub("^%s+", ""):gsub("%s+$", "")
+    if notes == "" then
+        return _("No changelog provided.")
+    end
+    return notes
+end
+
+local function ptf_bold(text)
+    if type(text) ~= "string" or text == "" then
+        return ""
+    end
+    return PTF_BOLD_START .. text .. PTF_BOLD_END
+end
+
+local function normalize_whats_changed_line(line)
+    local heading = line:match("^%s*##%s*(.-)%s*$")
+    if not heading then
+        return nil
+    end
+    local lower = heading:lower()
+    if lower == "what's changed" or lower == "what’s changed" then
+        return ptf_bold(_("What's changed"))
+    end
+    return nil
+end
+
+local function render_release_text(entry)
+    local label = entry.version ~= "" and ("v" .. entry.version) or (entry.tag or _("unknown"))
+    local lines = {
+        ptf_bold(label),
+    }
+    local notes = normalize_release_notes(entry.notes)
+    for raw in (notes .. "\n"):gmatch("(.-)\n") do
+        local line = raw:gsub("\r", "")
+        local normalized = normalize_whats_changed_line(line)
+        if normalized then
+            lines[#lines + 1] = normalized
+        else
+            lines[#lines + 1] = line
+        end
+    end
+
+    while #lines > 0 and lines[#lines] == "" do
+        table.remove(lines)
+    end
+    return table.concat(lines, "\n")
+end
+
+local function sort_entries_most_recent(entries)
+    table.sort(entries, function(a, b)
+        local a_time = type(a.release_time) == "string" and a.release_time or ""
+        local b_time = type(b.release_time) == "string" and b.release_time or ""
+        if a_time ~= b_time then
+            return a_time > b_time
+        end
+        local a_idx = tonumber(a.source_index) or 0
+        local b_idx = tonumber(b.source_index) or 0
+        return a_idx < b_idx
+    end)
+end
+
+--- Decode a releases list JSON body into installable release entries.
+local function parse_release_entries(body)
     local ok, releases = pcall(json.decode, body)
     if not ok or type(releases) ~= "table" then
         logger.warn("ZenUpdater: JSON decode failed")
         return nil
     end
-    local stable_tag, stable_url, beta_tag, beta_url
+    local decoded_count = #releases
+    if decoded_count == 0 then
+        if type(releases.message) == "string" then
+            logger.warn(
+                "ZenUpdater: releases API returned non-list payload message=",
+                releases.message,
+                "status=",
+                tostring(releases.status)
+            )
+        else
+            logger.warn("ZenUpdater: decoded releases list is empty")
+        end
+    end
+    local entries = {}
+    local drop_missing_assets_table = 0
+    local drop_missing_named_asset = 0
+    local drop_invalid_asset_url = 0
     for _i, release in ipairs(releases) do
-        local asset_url = get_asset_url(release)
-        if asset_url then
-            if not stable_tag and not release.prerelease then
-                stable_tag = release.tag_name
-                stable_url = asset_url
-            end
-            if not beta_tag and release.prerelease then
-                beta_tag = release.tag_name
-                beta_url = asset_url
+        local asset, reason = get_asset_info(release)
+        if asset then
+            local tag = release.tag_name
+            table.insert(entries, {
+                tag = tag,
+                version = tag and (tag:match("^v?(.+)$") or tag) or "",
+                url = asset.url,
+                sha256 = asset.sha256,
+                prerelease = release.prerelease == true,
+                notes = normalize_release_notes(release.body),
+                release_time = release.published_at or release.created_at or "",
+                source_index = _i,
+            })
+        elseif reason == "missing_assets_table" then
+            drop_missing_assets_table = drop_missing_assets_table + 1
+        elseif reason == "missing_named_asset" then
+            drop_missing_named_asset = drop_missing_named_asset + 1
+        elseif reason == "invalid_asset_url" then
+            drop_invalid_asset_url = drop_invalid_asset_url + 1
+        end
+    end
+    sort_entries_most_recent(entries)
+    logger.dbg(
+        "ZenUpdater: parse_release_entries total=",
+        decoded_count,
+        "accepted=",
+        #entries,
+        "drop_missing_assets_table=",
+        drop_missing_assets_table,
+        "drop_missing_named_asset=",
+        drop_missing_named_asset,
+        "drop_invalid_asset_url=",
+        drop_invalid_asset_url
+    )
+    return entries
+end
+
+--- Filter installable entries by channel. Stable: releases only.
+--- Beta: releases + prereleases, preferring stable for the same M.m.p base.
+local function filter_entries_for_channel(entries, channel)
+    local filtered = {}
+    if channel == "stable" then
+        local skipped_prerelease = 0
+        for _i, entry in ipairs(entries) do
+            if not entry.prerelease then
+                table.insert(filtered, entry)
+            else
+                skipped_prerelease = skipped_prerelease + 1
             end
         end
-        if stable_tag and beta_tag then break end
+        logger.dbg(
+            "ZenUpdater: filter channel=stable in=",
+            #entries,
+            "out=",
+            #filtered,
+            "skipped_prerelease=",
+            skipped_prerelease
+        )
+        return filtered
     end
-    return stable_tag, stable_url, beta_tag, beta_url
+
+    local base_index = {}
+    local replaced_with_stable = 0
+    for _i, entry in ipairs(entries) do
+        local base = semver_base(entry.tag)
+        local idx = base_index[base]
+        if not idx then
+            table.insert(filtered, entry)
+            base_index[base] = #filtered
+        else
+            local existing = filtered[idx]
+            if existing.prerelease and not entry.prerelease then
+                filtered[idx] = entry
+                replaced_with_stable = replaced_with_stable + 1
+            end
+        end
+    end
+    logger.dbg(
+        "ZenUpdater: filter channel=beta in=",
+        #entries,
+        "out=",
+        #filtered,
+        "replaced_with_stable=",
+        replaced_with_stable
+    )
+    return filtered
+end
+
+-- Changelog should show all channel entries in chronological order without
+-- collapsing prerelease/stable siblings that share the same semver base.
+local function filter_changelog_entries_for_channel(entries, channel)
+    if channel == "stable" then
+        local stable = {}
+        for _i, entry in ipairs(entries) do
+            if not entry.prerelease then
+                table.insert(stable, entry)
+            end
+        end
+        logger.dbg(
+            "ZenUpdater: changelog stable filter in=",
+            #entries,
+            "out=",
+            #stable
+        )
+        return stable
+    end
+
+    logger.dbg(
+        "ZenUpdater: changelog beta filter in=",
+        #entries,
+        "out=",
+        #entries
+    )
+    return entries
 end
 
 --- Best-effort HTTPS GET; returns the response body string or nil.
@@ -126,14 +400,23 @@ local function https_get(url)
     logger.dbg("ZenUpdater: GET", url)
     local body = {}
     local ok_req, req_err = pcall(function()
-        local _, code = https.request{
+        local _, code, _headers, status = https.request{
             url     = url,
             headers = { ["User-Agent"] = "zen_ui.koplugin" },
             sink    = ltn12.sink.table(body),
         }
         -- code can be a string error message on Kobo (e.g. "connection refused")
         if code ~= 200 then
-            logger.warn("ZenUpdater: https_get non-200:", tostring(code))
+            local body_text = table.concat(body)
+            local snippet = body_text:sub(1, 200)
+            logger.warn(
+                "ZenUpdater: https_get non-200 code=",
+                tostring(code),
+                "status=",
+                tostring(status),
+                "body=",
+                snippet
+            )
             body = nil
         end
     end)
@@ -145,16 +428,37 @@ local function https_get(url)
     return table.concat(body)
 end
 
---- Returns true only for a proper release asset download URL.
-local function is_valid_asset_url(url)
-    return type(url) == "string" and url:find("/releases/download/", 1, true) ~= nil
-end
-
 --- Download a file via HTTPS to dest_path, following up to 5 redirects.
 --- Returns true on success, or false + error message on failure.
-local function https_download(url, dest_path, depth)
+local function read_sha_from_command(cmd)
+    local pipe = io.popen(cmd)
+    if not pipe then return nil end
+    local out = pipe:read("*a") or ""
+    pcall(pipe.close, pipe)
+    for token in out:gmatch("([0-9a-fA-F]+)") do
+        if #token == 64 then
+            return token:lower()
+        end
+    end
+    return nil
+end
+
+local function compute_sha256(path)
+    local q = string.format("%q", path)
+    return read_sha_from_command("shasum -a 256 " .. q .. " 2>/dev/null")
+        or read_sha_from_command("sha256sum " .. q .. " 2>/dev/null")
+        or read_sha_from_command("openssl dgst -sha256 " .. q .. " 2>/dev/null")
+end
+
+local function https_download(url, dest_path, expected_sha256, depth)
     depth = depth or 0
     if depth > 5 then return false, "too many redirects" end
+    if not is_valid_asset_url(url) then
+        return false, "untrusted origin url"
+    end
+    if not is_valid_sha256_digest(expected_sha256) then
+        return false, "missing sha256 digest"
+    end
 
     local ok_ssl, https = pcall(require, "ssl.https")
     local ok_ltn, ltn12 = pcall(require, "ltn12")
@@ -165,6 +469,9 @@ local function https_download(url, dest_path, depth)
     -- Resolve any redirect chain via HEAD requests (avoids writing partial data).
     local resolved_url = url
     for _attempt = 1, 5 do
+        if not is_valid_asset_url(resolved_url) then
+            return false, "untrusted redirect origin"
+        end
         local _, r_code, r_headers = https.request{
             url     = resolved_url,
             method  = "HEAD",
@@ -173,10 +480,18 @@ local function https_download(url, dest_path, depth)
         }
         if (r_code == 301 or r_code == 302 or r_code == 307 or r_code == 308)
             and r_headers and r_headers.location then
-            resolved_url = r_headers.location
+            local next_url = resolve_redirect_url(resolved_url, r_headers.location)
+            if not next_url or not is_valid_asset_url(next_url) then
+                return false, "untrusted redirect origin"
+            end
+            resolved_url = next_url
         else
             break
         end
+    end
+
+    if not is_valid_asset_url(resolved_url) then
+        return false, "untrusted download origin"
     end
 
     -- Perform the actual download.
@@ -195,6 +510,17 @@ local function https_download(url, dest_path, depth)
         os.remove(dest_path)
         return false, "HTTP " .. tostring(dl_code)
     end
+
+    local actual_sha256 = compute_sha256(dest_path)
+    if not actual_sha256 then
+        os.remove(dest_path)
+        return false, "sha256 tool unavailable"
+    end
+    if actual_sha256 ~= expected_sha256:lower() then
+        os.remove(dest_path)
+        return false, "sha256 mismatch"
+    end
+
     return true
 end
 
@@ -212,6 +538,7 @@ local GS_KEY_TIME    = "zen_ui_last_update_check"
 local GS_KEY_AVAIL   = "zen_ui_update_available"
 local GS_KEY_VER     = "zen_ui_latest_version"
 local GS_KEY_URL     = "zen_ui_update_dl_url"
+local GS_KEY_SHA     = "zen_ui_update_sha256"
 local GS_KEY_CHANNEL = "zen_ui_update_channel"
 local GS_KEY_AUTO    = "zen_ui_update_auto_check"
 
@@ -255,6 +582,7 @@ local function persist_state(now)
     gs:saveSetting(GS_KEY_AVAIL, M._has_update)
     gs:saveSetting(GS_KEY_VER,   M._latest_ver or "")
     gs:saveSetting(GS_KEY_URL,   M._dl_url or "")
+    gs:saveSetting(GS_KEY_SHA,   M._latest_sha256 or "")
     pcall(gs.flush, gs)
 end
 
@@ -263,11 +591,15 @@ local function clear_update_state()
     M._has_update = false
     M._latest_ver = nil
     M._dl_url     = nil
+    M._latest_sha256 = nil
+    M._latest_notes = nil
+    M._last_error = nil
     local gs = get_gs()
     if gs then
         gs:saveSetting(GS_KEY_AVAIL, false)
         gs:saveSetting(GS_KEY_VER,   "")
         gs:saveSetting(GS_KEY_URL,   "")
+        gs:saveSetting(GS_KEY_SHA,   "")
         pcall(gs.flush, gs)
     end
 end
@@ -276,11 +608,17 @@ local function load_cached_state()
     local gs = get_gs()
     if not gs then return end
     M._has_update = gs:readSetting(GS_KEY_AVAIL) == true
+    local sha = gs:readSetting(GS_KEY_SHA)
+    M._latest_sha256 = is_valid_sha256_digest(sha) and sha:lower() or nil
+    M._latest_notes = nil
     local ver = gs:readSetting(GS_KEY_VER)
     M._latest_ver = (type(ver) == "string" and ver ~= "") and ver or nil
     local url = gs:readSetting(GS_KEY_URL)
     -- Reject stale zipball/tarball URLs from before the asset-only fix.
     M._dl_url = is_valid_asset_url(url) and url or nil
+    if not M._dl_url then
+        M._latest_sha256 = nil
+    end
     -- Discard stale notifications when the installed version already matches
     -- or exceeds the cached release (e.g. after a successful update).
     if M._has_update and not semver_gt(M._latest_ver or "", get_current_version()) then
@@ -292,46 +630,148 @@ end
 local function do_network_check()
     local channel = get_channel()
     local current = get_current_version()
+    M._last_error = nil
     logger.dbg("ZenUpdater: do_network_check channel=", channel, "current=", current)
 
     local body = https_get(GITHUB_RELEASES_URL .. "?per_page=100")
     if not body then
         logger.warn("ZenUpdater: no response from releases API")
+        M._last_error = _("Could not reach update server. Check your internet connection.")
         return false
     end
 
-    local stable_tag, stable_url, beta_tag, beta_url = parse_release_list(body)
-    logger.dbg("ZenUpdater: stable=", stable_tag, "beta=", beta_tag)
-
-    local tag, dl_url
-    if channel == "stable" then
-        -- Stable channel is strict: never fall back to prereleases.
-        tag    = stable_tag
-        dl_url = stable_url
-    elseif beta_tag and semver_base_gt(beta_tag, stable_tag or "0.0.0") then
-        -- Beta channel surfaces prereleases, but prefers stable when bases match.
-        tag    = beta_tag
-        dl_url = beta_url
-    elseif stable_tag then
-        tag    = stable_tag
-        dl_url = stable_url
-    else
-        tag    = beta_tag
-        dl_url = beta_url
+    local entries = parse_release_entries(body)
+    if not entries then
+        M._last_error = _("Could not read release data from update server.")
+        return false
     end
 
-    if not tag then
-        logger.warn("ZenUpdater: no eligible tag for channel", channel)
+    local channel_entries = filter_entries_for_channel(entries, channel)
+    local selected
+    for _i, entry in ipairs(channel_entries) do
+        if is_valid_sha256_digest(entry.sha256) then
+            selected = entry
+            break
+        end
+    end
+
+    if not selected then
+        logger.warn("ZenUpdater: no eligible tag with digest for channel", channel)
         M._has_update = false
         M._latest_ver = nil
         M._dl_url     = nil
-        return true
+        M._latest_sha256 = nil
+        M._latest_notes = nil
+        M._last_error = _("Release metadata is invalid or incomplete.")
+        return false
     end
-    M._latest_ver = tag:match("^v?(.+)$") or tag
-    M._dl_url     = dl_url
-    M._has_update = semver_gt(tag, current)
+
+    M._latest_ver = selected.version
+    M._dl_url     = selected.url
+    M._latest_sha256 = selected.sha256
+    M._latest_notes = selected.notes
+    M._has_update = semver_gt(selected.tag, current)
+    M._last_error = nil
     logger.dbg("ZenUpdater: latest=", M._latest_ver, "has_update=", tostring(M._has_update))
     return true
+end
+
+local function ensure_selected_release_details()
+    if M._latest_ver and M._latest_notes and is_valid_asset_url(M._dl_url)
+        and is_valid_sha256_digest(M._latest_sha256) then
+        return true
+    end
+    return do_network_check()
+end
+
+local function fetch_channel_release_entries(channel)
+    logger.dbg("ZenUpdater: fetch_channel_release_entries channel=", tostring(channel))
+    local body = https_get(GITHUB_RELEASES_URL .. "?per_page=100")
+    if not body then
+        logger.warn("ZenUpdater: changelog fetch failed: empty API response")
+        return nil
+    end
+    local entries = parse_release_entries(body)
+    if not entries then
+        logger.warn("ZenUpdater: changelog fetch failed: parse_release_entries returned nil")
+        return nil
+    end
+    local filtered = filter_changelog_entries_for_channel(entries, channel)
+    logger.dbg(
+        "ZenUpdater: changelog entries channel=",
+        tostring(channel),
+        "raw=",
+        #entries,
+        "filtered=",
+        #filtered
+    )
+    return filtered
+end
+
+local function build_changelog_text(entries, count)
+    local shown = math.min(count, #entries)
+    local blocks = {}
+    for _i = 1, shown do
+        local entry = entries[_i]
+        blocks[#blocks + 1] = render_release_text(entry)
+    end
+    local text = table.concat(blocks, "\n\n")
+    if text == "" then
+        text = _("No changelog provided.")
+    else
+        text = PTF_HEADER .. text
+    end
+    return text, shown < #entries
+end
+
+local function _strip_inline_markdown(text)
+    if type(text) ~= "string" then return "" end
+    local out = text
+    out = out:gsub("%[([^%]]+)%]%(([^%)]+)%)", "%1")
+    out = out:gsub("`([^`]+)`", "%1")
+    out = out:gsub("%*%*(.-)%*%*", "%1")
+    out = out:gsub("__(.-)__", "%1")
+    out = out:gsub("^%s+", ""):gsub("%s+$", "")
+    return out
+end
+
+local function build_single_release_bullets(notes)
+    local normalized = normalize_release_notes(notes)
+    if normalized == _("No changelog provided.") then
+        return { _("No changelog provided.") }
+    end
+
+    local bullets = {}
+    local saw_explicit_bullets = false
+    for raw in (normalized .. "\n"):gmatch("(.-)\n") do
+        local line = raw:gsub("\r", "")
+        local trimmed = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if trimmed ~= "" then
+            if trimmed:match("^##%s*") then
+                -- Skip section headings like "## What's changed" in this compact view.
+            else
+                local item = trimmed:match("^[-*+]%s+(.+)$")
+                    or trimmed:match("^%d+%.%s+(.+)$")
+                if item then
+                    saw_explicit_bullets = true
+                    item = _strip_inline_markdown(item)
+                    if item ~= "" then
+                        bullets[#bullets + 1] = item
+                    end
+                elseif not saw_explicit_bullets and not trimmed:match("^#") then
+                    local plain = _strip_inline_markdown(trimmed)
+                    if plain ~= "" then
+                        bullets[#bullets + 1] = plain
+                    end
+                end
+            end
+        end
+    end
+
+    if #bullets == 0 then
+        bullets[1] = _("No changelog provided.")
+    end
+    return bullets
 end
 
 --- Run do_network_check() in a non-blocking subprocess via Trapper.
@@ -344,15 +784,17 @@ local function network_check_async(trap_widget, setup_fn, on_done, on_cancelled)
     Trapper:wrap(function()
         local _co = coroutine.running()
         if setup_fn then setup_fn(_co) end
-        local completed, net_ok, has_upd, latest_ver, dl_url =
+        local completed, net_ok, has_upd, latest_ver, dl_url, latest_sha256, latest_notes =
             Trapper:dismissableRunInSubprocess(function()
                 local ok = do_network_check()
-                return ok, M._has_update, M._latest_ver, M._dl_url
+                return ok, M._has_update, M._latest_ver, M._dl_url, M._latest_sha256, M._latest_notes
             end, trap_widget)
         if completed and net_ok then
             M._has_update = has_upd
             M._latest_ver = latest_ver
             M._dl_url     = dl_url
+            M._latest_sha256 = latest_sha256
+            M._latest_notes = latest_notes
         end
         if not completed then
             if on_cancelled then on_cancelled() end
@@ -530,11 +972,15 @@ local function _do_install(screen, plugin_root, plugins_dir)
         return ok_nm and NetworkMgr and NetworkMgr:isWifiOn()
     end
 
-    if not is_valid_asset_url(M._dl_url) then
+    if not is_valid_asset_url(M._dl_url) or not is_valid_sha256_digest(M._latest_sha256) then
         do_network_check()
     end
     if not is_valid_asset_url(M._dl_url) then
         screen:update{ subtitle = _("No update asset found."), button = _("OK"), dismissable = true }
+        return
+    end
+    if not is_valid_sha256_digest(M._latest_sha256) then
+        screen:update{ subtitle = _("Update failed: missing checksum."), button = _("OK"), dismissable = true }
         return
     end
 
@@ -568,7 +1014,7 @@ local function _do_install(screen, plugin_root, plugins_dir)
         UIManager:scheduleIn(INSTALL_TIMEOUT, timeout_cb)
 
         local completed, ok, err = Trapper:dismissableRunInSubprocess(function()
-            return https_download(M._dl_url, zip_path)
+            return https_download(M._dl_url, zip_path, M._latest_sha256)
         end, screen)
 
         UIManager:unschedule(timeout_cb)
@@ -639,20 +1085,37 @@ local function _show_update_screen_and_install(plugin)
         or (plugin and type(plugin.path) == "string" and plugin.path ~= "" and plugin.path)
         or ""
     local plugins_dir = plugin_root:match("^(.*)/[^/]+$") or plugin_root
+
+    -- Best-effort refresh so the update prompt includes changelog text.
+    if not M._latest_notes then
+        ensure_selected_release_details()
+    end
+
     local ver_label   = M._latest_ver and ("v" .. M._latest_ver) or _("latest")
+    local changelog_items = build_single_release_bullets(M._latest_notes)
 
     local screen
     screen = ZenScreen:new{
+        title        = _("Zen UI"),
         subtitle     = _("Update available: ") .. ver_label,
+        changelog    = changelog_items,
         button       = _("Update now"),
         later_button = _("Later"),
         dismissable  = true,
     }
     screen._on_button_action = function()
-        screen:update{ subtitle = _("Downloading…"), button = false, later_button = false, dismissable = false }
+        local progress_screen = ZenScreen:new{
+            title        = _("Zen UI"),
+            subtitle     = _("Downloading…"),
+            button       = false,
+            later_button = false,
+            dismissable  = false,
+        }
+        UIManager:close(screen)
+        UIManager:show(progress_screen)
         UIManager:forceRePaint()
         UIManager:scheduleIn(0.1, function()
-            _do_install(screen, plugin_root, plugins_dir)
+            _do_install(progress_screen, plugin_root, plugins_dir)
         end)
     end
     UIManager:show(screen)
@@ -673,10 +1136,9 @@ end
 --- is available, or nil when no update has been detected.
 function M.build_update_available_item(plugin)
     if not M._has_update then return nil end
-    local ver_label = M._latest_ver and ("v" .. M._latest_ver) or _("latest")
     return {
         _zen_update_banner = true,  -- marker so root_items.callback can remove it
-        text          = "\u{F01B} " .. _("Update available: ") .. ver_label,
+        text          = "\u{F01B} " .. _("Update available"),
         keep_menu_open = true,
         callback      = function()
             M.run_update(plugin)
@@ -691,8 +1153,7 @@ function M.build_update_now_item(plugin)
     return {
         text_func = function()
             if M._has_update then
-                local ver_label = M._latest_ver and ("v" .. M._latest_ver) or _("latest")
-                return "\u{F01B} " .. _("Update available: ") .. ver_label
+                return "\u{F01B} " .. _("Update available")
             end
             return _("Check for updates")
         end,
@@ -707,6 +1168,8 @@ function M.build_update_now_item(plugin)
             M._has_update = false
             M._latest_ver = nil
             M._dl_url     = nil
+            M._latest_sha256 = nil
+            M._latest_notes = nil
             local gs = get_gs()
             if gs then
                 gs:saveSetting(GS_KEY_TIME, 0)
@@ -742,7 +1205,7 @@ function M.build_update_now_item(plugin)
                             end
                             if not net_ok then
                                 screen:update{
-                                    subtitle    = _("Could not reach update server. Check your internet connection."),
+                                    subtitle    = M._last_error or _("Could not reach update server. Check your internet connection."),
                                     button      = _("OK"),
                                     dismissable = true,
                                 }
@@ -751,11 +1214,26 @@ function M.build_update_now_item(plugin)
                                 UIManager:close(screen)
                                 _show_update_screen_and_install(plugin)
                             else
-                                screen:update{
-                                    subtitle    = _("Zen UI is up to date."),
-                                    button      = _("OK"),
-                                    dismissable = true,
-                                }
+                                local current = get_current_version()
+                                if M._latest_ver and semver_eq(M._latest_ver, current) then
+                                    screen:update{
+                                        subtitle    = _("Zen UI is up to date."),
+                                        button      = _("OK"),
+                                        dismissable = true,
+                                    }
+                                elseif M._latest_ver and semver_gt(current, M._latest_ver) then
+                                    screen:update{
+                                        subtitle    = _("Installed version is newer than the latest release."),
+                                        button      = _("OK"),
+                                        dismissable = true,
+                                    }
+                                else
+                                    screen:update{
+                                        subtitle    = M._last_error or _("Could not determine update status."),
+                                        button      = _("OK"),
+                                        dismissable = true,
+                                    }
+                                end
                             end
                         end,
                         function()
@@ -770,6 +1248,87 @@ function M.build_update_now_item(plugin)
                 NetworkMgr:runWhenOnline(run_check)
             else
                 run_check()
+            end
+        end,
+    }
+end
+
+--- Returns a menu item that opens a scrollable release changelog viewer.
+function M.build_changelog_item()
+    return {
+        text = _("Changelog"),
+        keep_menu_open = true,
+        callback = function()
+            local UIManager = require("ui/uimanager")
+            local ZenScreen = require("common/zen_screen")
+            local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
+
+            local function open_viewer()
+                local channel = get_channel()
+                logger.dbg("ZenUpdater: opening changelog viewer channel=", tostring(channel))
+
+                local screen = ZenScreen:new{
+                    title        = _("Changelog"),
+                    title_icon   = true,
+                    scroll_text  = _("Loading changelog..."),
+                    button       = false,
+                    later_button = _("Close"),
+                    dismissable  = true,
+                }
+                UIManager:show(screen)
+                UIManager:forceRePaint()
+
+                UIManager:scheduleIn(0.1, function()
+                    local entries = fetch_channel_release_entries(channel)
+                    if not entries then
+                        logger.warn("ZenUpdater: changelog viewer failed to load entries for channel", channel)
+                        screen:update{
+                            scroll_text = _("Could not reach update server. Check your internet connection.\n\nUnable to load changelog."),
+                            button = false,
+                            later_button = _("Close"),
+                            dismissable = true,
+                        }
+                        return
+                    end
+
+                    if #entries == 0 then
+                        logger.warn("ZenUpdater: changelog viewer has zero entries for channel", channel)
+                        screen:update{
+                            scroll_text = _("No changelog entries found.\n\nNo releases are available for this channel."),
+                            button = false,
+                            later_button = _("Close"),
+                            dismissable = true,
+                        }
+                        return
+                    end
+
+                    local shown = 5
+                    local function refresh_text()
+                        local text, has_more = build_changelog_text(entries, shown)
+                        screen._on_button_action = nil
+                        screen:update{
+                            scroll_text = text,
+                            button = has_more and _("Load more") or false,
+                            later_button = _("Close"),
+                            dismissable = true,
+                            preserve_scroll = true,
+                        }
+                        if has_more then
+                            screen._on_button_action = function()
+                                shown = math.min(shown + 5, #entries)
+                                refresh_text()
+                            end
+                        end
+                    end
+
+                    refresh_text()
+                end)
+            end
+
+            if ok_nm and NetworkMgr and not NetworkMgr:isWifiOn() then
+                NetworkMgr:runWhenOnline(open_viewer)
+            else
+                open_viewer()
             end
         end,
     }
@@ -810,6 +1369,8 @@ function M.set_channel(ch)
     M._has_update = false
     M._latest_ver = nil
     M._dl_url     = nil
+    M._latest_sha256 = nil
+    M._latest_notes = nil
     gs:saveSetting(GS_KEY_TIME, 0)
     pcall(gs.flush, gs)
 end
