@@ -5,6 +5,7 @@
 local _ = require("gettext")
 local json = require("json")
 local logger = require("logger")
+local ConfigManager = require("config/manager")
 
 local GITHUB_OWNER = "AnthonyGress"
 local GITHUB_REPO = "zen_ui.koplugin"
@@ -531,25 +532,36 @@ local NET_RETRY_DELAY       = 2 * 60    -- seconds to wait before retrying when 
 local NET_ERROR_BASE_DELAY  = 30         -- first retry delay (s) after API failure; doubles each retry
 local NET_ERROR_MAX_RETRIES = 2          -- max error retries: 30s, 60s
 local INSTALL_TIMEOUT       = 120        -- max seconds for download + apply
-local GS_KEY_TIME    = "zen_ui_last_update_check"
-local GS_KEY_AVAIL   = "zen_ui_update_available"
-local GS_KEY_VER     = "zen_ui_latest_version"
-local GS_KEY_URL     = "zen_ui_update_dl_url"
-local GS_KEY_SHA     = "zen_ui_update_sha256"
-local GS_KEY_CHANNEL = "zen_ui_update_channel"
-local GS_KEY_AUTO    = "zen_ui_update_auto_check"
+local UP_KEY_JUST_UPDATED = "just_updated_version"
+local UP_KEY_TIME         = "last_update_check"
+local UP_KEY_AVAIL        = "update_available"
+local UP_KEY_VER          = "latest_version"
+local UP_KEY_URL          = "update_dl_url"
+local UP_KEY_SHA          = "update_sha256"
+local UP_KEY_CHANNEL      = "update_channel"
+local UP_KEY_AUTO         = "update_auto_check"
 
---- Load or write persisted update state via G_reader_settings.
-local function get_gs()
-    local ok, gs = pcall(function() return G_reader_settings end)
-    return (ok and gs) or nil
+local function load_updater_config()
+    local ok, cfg = pcall(ConfigManager.load)
+    if not ok or type(cfg) ~= "table" then
+        return nil, nil
+    end
+    if type(cfg.updater) ~= "table" then
+        cfg.updater = {}
+    end
+    return cfg, cfg.updater
+end
+
+local function save_updater_config(cfg)
+    if type(cfg) ~= "table" then return end
+    pcall(ConfigManager.save, cfg)
 end
 
 --- Returns true when the 24h check interval has elapsed since the last check.
 local function is_check_due()
-    local gs  = get_gs()
+    local _cfg, updater = load_updater_config()
     local now = os.time()
-    local last = gs and gs:readSetting(GS_KEY_TIME) or 0
+    local last = updater and updater[UP_KEY_TIME] or 0
     local last_num = type(last) == "number" and last or 0
     local delta = now - last_num
     local due = delta >= CHECK_INTERVAL
@@ -558,29 +570,27 @@ local function is_check_due()
 end
 
 local function get_channel()
-    local gs = get_gs()
-    if gs then
-        local ch = gs:readSetting(GS_KEY_CHANNEL)
-        if ch == "beta" then return "beta" end
-    end
+    local _cfg, updater = load_updater_config()
+    local ch = updater and updater[UP_KEY_CHANNEL]
+    if ch == "beta" then return "beta" end
     return "stable"
 end
 
 local function is_auto_check_enabled()
-    local gs = get_gs()
-    if not gs then return true end
-    return gs:readSetting(GS_KEY_AUTO) ~= false
+    local _cfg, updater = load_updater_config()
+    if not updater then return true end
+    return updater[UP_KEY_AUTO] ~= false
 end
 
 local function persist_state(now)
-    local gs = get_gs()
-    if not gs then return end
-    gs:saveSetting(GS_KEY_TIME,  now)
-    gs:saveSetting(GS_KEY_AVAIL, M._has_update)
-    gs:saveSetting(GS_KEY_VER,   M._latest_ver or "")
-    gs:saveSetting(GS_KEY_URL,   M._dl_url or "")
-    gs:saveSetting(GS_KEY_SHA,   M._latest_sha256 or "")
-    pcall(gs.flush, gs)
+    local cfg, updater = load_updater_config()
+    if not updater then return end
+    updater[UP_KEY_TIME]  = now
+    updater[UP_KEY_AVAIL] = M._has_update == true
+    updater[UP_KEY_VER]   = M._latest_ver or ""
+    updater[UP_KEY_URL]   = M._dl_url or ""
+    updater[UP_KEY_SHA]   = M._latest_sha256 or ""
+    save_updater_config(cfg)
 end
 
 --- Clear all persisted update state (called after a successful install).
@@ -591,26 +601,25 @@ local function clear_update_state()
     M._latest_sha256 = nil
     M._latest_notes = nil
     M._last_error = nil
-    local gs = get_gs()
-    if gs then
-        gs:saveSetting(GS_KEY_AVAIL, false)
-        gs:saveSetting(GS_KEY_VER,   "")
-        gs:saveSetting(GS_KEY_URL,   "")
-        gs:saveSetting(GS_KEY_SHA,   "")
-        pcall(gs.flush, gs)
-    end
+    local cfg, updater = load_updater_config()
+    if not updater then return end
+    updater[UP_KEY_AVAIL] = false
+    updater[UP_KEY_VER] = ""
+    updater[UP_KEY_URL] = ""
+    updater[UP_KEY_SHA] = ""
+    save_updater_config(cfg)
 end
 
 local function load_cached_state()
-    local gs = get_gs()
-    if not gs then return end
-    M._has_update = gs:readSetting(GS_KEY_AVAIL) == true
-    local sha = gs:readSetting(GS_KEY_SHA)
+    local _cfg, updater = load_updater_config()
+    if not updater then return end
+    M._has_update = updater[UP_KEY_AVAIL] == true
+    local sha = updater[UP_KEY_SHA]
     M._latest_sha256 = is_valid_sha256_digest(sha) and sha:lower() or nil
     M._latest_notes = nil
-    local ver = gs:readSetting(GS_KEY_VER)
+    local ver = updater[UP_KEY_VER]
     M._latest_ver = (type(ver) == "string" and ver ~= "") and ver or nil
-    local url = gs:readSetting(GS_KEY_URL)
+    local url = updater[UP_KEY_URL]
     -- Reject stale zipball/tarball URLs from before the asset-only fix.
     M._dl_url = is_valid_asset_url(url) and url or nil
     if not M._dl_url then
@@ -916,7 +925,7 @@ function M.schedule_wakeup_check()
     logger.info("ZenUpdater: wakeup check scheduled in ", NET_SETTLE_DELAY, "s")
 end
 
---- Check for updates at most once every 24 h (throttled via G_reader_settings).
+--- Check for updates at most once every 24 h (throttled via zen_ui_config).
 --- Returns "ok" (live check succeeded), "error" (network failure), or "cached" (throttled).
 function M.check_for_update()
     if M._checked then
@@ -925,9 +934,9 @@ function M.check_for_update()
     end
     M._checked = true
 
-    local gs  = get_gs()
+    local _cfg, updater = load_updater_config()
     local now = os.time()
-    local last = gs and gs:readSetting(GS_KEY_TIME) or 0
+    local last = updater and updater[UP_KEY_TIME] or 0
     logger.dbg("ZenUpdater: check_for_update now=", now, "last=", last, "interval=", CHECK_INTERVAL)
 
     if type(last) == "number" and (now - last) < CHECK_INTERVAL then
@@ -1359,11 +1368,12 @@ local function _do_install(screen, plugin_root, plugins_dir)
         os.remove(zip_path)
         logger.info("ZenUpdater: install transaction completed successfully")
 
+        local installed_version = M._latest_ver or ""
         clear_update_state()
-        local gs2 = get_gs()
-        if gs2 then
-            gs2:saveSetting("zen_ui_just_updated", M._latest_ver or "")
-            pcall(gs2.flush, gs2)
+        local cfg2, updater2 = load_updater_config()
+        if updater2 then
+            updater2[UP_KEY_JUST_UPDATED] = installed_version
+            save_updater_config(cfg2)
         end
 
         screen:update{ subtitle = _("Rebooting") .. "...", button = false }
@@ -1469,10 +1479,10 @@ function M.build_update_now_item(plugin)
             M._dl_url     = nil
             M._latest_sha256 = nil
             M._latest_notes = nil
-            local gs = get_gs()
-            if gs then
-                gs:saveSetting(GS_KEY_TIME, 0)
-                pcall(gs.flush, gs)
+            local cfg, updater = load_updater_config()
+            if updater then
+                updater[UP_KEY_TIME] = 0
+                save_updater_config(cfg)
             end
 
             local function run_check()
@@ -1645,11 +1655,11 @@ end
 
 --- Enable or disable automatic background update checks.
 function M.set_auto_check_enabled(enabled)
-    local gs = get_gs()
-    if not gs then return end
+    local cfg, updater = load_updater_config()
+    if not updater then return end
     local on = enabled ~= false
-    gs:saveSetting(GS_KEY_AUTO, on)
-    pcall(gs.flush, gs)
+    updater[UP_KEY_AUTO] = on
+    save_updater_config(cfg)
     if on then
         M.schedule_wakeup_check()
     else
@@ -1659,10 +1669,9 @@ end
 
 --- Set the update channel and reset cached state so the next check uses it.
 function M.set_channel(ch)
-    local gs = get_gs()
-    if not gs then return end
-    gs:saveSetting(GS_KEY_CHANNEL, ch == "beta" and "beta" or "stable")
-    pcall(gs.flush, gs)
+    local cfg, updater = load_updater_config()
+    if not updater then return end
+    updater[UP_KEY_CHANNEL] = ch == "beta" and "beta" or "stable"
     -- Invalidate cache so next check_for_update() goes to the network.
     M._checked    = false
     M._has_update = false
@@ -1670,8 +1679,8 @@ function M.set_channel(ch)
     M._dl_url     = nil
     M._latest_sha256 = nil
     M._latest_notes = nil
-    gs:saveSetting(GS_KEY_TIME, 0)
-    pcall(gs.flush, gs)
+    updater[UP_KEY_TIME] = 0
+    save_updater_config(cfg)
 end
 
 --- Returns a radio-style "Update channel" sub-menu item for the About section.
