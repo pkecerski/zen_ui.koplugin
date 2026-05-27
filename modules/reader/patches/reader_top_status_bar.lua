@@ -87,7 +87,7 @@ local function apply_reader_top_status_bar()
         end
         local statm = io.open("/proc/self/statm", "r")
         if statm then
-            local pages, rss_pages = statm:read("*number", "*number")
+            local rss_pages = select(2, statm:read("*number", "*number"))
             statm:close()
             if rss_pages then
                 cached_ram_text = string.format("%dM", math.floor(rss_pages / 256))
