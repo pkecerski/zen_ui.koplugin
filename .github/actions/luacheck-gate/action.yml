@@ -1,0 +1,57 @@
+name: LuaCheck Gate
+description: Run LuaCheck and fail only when LuaCheck reports errors.
+
+inputs:
+  lua-version:
+    description: Lua runtime version used for LuaCheck.
+    required: false
+    default: "5.1"
+  targets:
+    description: Space-separated files/directories to lint.
+    required: false
+    default: "_meta.lua main.lua common config modules"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Lua
+      uses: leafo/gh-actions-lua@v11
+      with:
+        luaVersion: ${{ inputs.lua-version }}
+
+    - name: Set up LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+
+    - name: Install LuaCheck
+      shell: bash
+      run: luarocks install luacheck
+
+    - name: Run LuaCheck (warnings allowed)
+      shell: bash
+      run: |
+        set +e
+        luacheck -q ${{ inputs.targets }} | tee /tmp/luacheck.out
+        luacheck_exit=${PIPESTATUS[0]}
+        set -e
+
+        errors=$(awk '/^Total: [0-9]+ warnings \/ [0-9]+ errors/{e=$5} END{print e}' /tmp/luacheck.out)
+
+        if [[ -z "$errors" ]]; then
+          if [[ "$luacheck_exit" -ne 0 ]]; then
+            echo "Luacheck failed before reporting totals (exit: $luacheck_exit)."
+            exit "$luacheck_exit"
+          fi
+          echo "Luacheck passed with no warnings."
+          exit 0
+        fi
+
+        if [[ "$errors" -gt 0 ]]; then
+          echo "Luacheck reported $errors errors."
+          exit 1
+        fi
+
+        if [[ "$luacheck_exit" -eq 1 ]]; then
+          echo "Luacheck reported warnings only; continuing."
+        else
+          echo "Luacheck passed with no warnings."
+        fi

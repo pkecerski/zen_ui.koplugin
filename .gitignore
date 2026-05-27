@@ -5,3 +5,4 @@ ___pycache___
 *.pyc
 .venv
 build
+.luarocks
