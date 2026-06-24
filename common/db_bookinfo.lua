@@ -280,16 +280,29 @@ function M.getTBRBooks()
     local ok_ds, DocSettings = pcall(require, "docsettings")
     if not ok_ds then return {} end
 
+    -- Checks if file is a book.
+    -- Should add other filetypee - these are just the ones I use privately
+    local function isBookFile(filepath)
+        if not filepath then return false end
+        local ext = filepath:match("^.+%.([^%.]+)$")
+        if not ext then return false end
+        ext = ext:lower()
+        return ext == "epub" or ext == "mobi" or ext == "azw3"
+    end
+
     local result = {}
     for _, filepath in ipairs(candidates) do
         if DocSettings:hasSidecarFile(filepath) then
             local ok3, doc = pcall(DocSettings.open, DocSettings, filepath)
             if ok3 and doc then
                 local summary = doc:readSetting("summary")
-                if summary and summary.status == "abandoned" then
+                if summary and (summary.status == "abandoned" or summary.status == "new" or summary.status == nil) then
                     table.insert(result, filepath)
                 end
             end
+        -- Catches newly added books, without .sdr files
+        elseif (not DocSettings:hasSidecarFile(filepath)) and (isBookFile(filepath)) then
+            table.insert(result, filepath)
         end
     end
 
